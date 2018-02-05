@@ -15,6 +15,9 @@
 @DEBUG = false
 
 require 'apipie-bindings'
+require 'rest-client'
+require 'json'
+require 'url_base64'
 
 # Log an error and exit.
 #
@@ -26,10 +29,23 @@ def error(msg)
   exit MIQ_STOP
 end
 
+def rest_request(action, url, payload=nil)
+  params = {
+    :method=>action, :url=>url, :verify_ssl=>false,
+    :headers=>{ :content_type=>:json, :accept=>:json,
+                :authorization=>"Basic #{url_base64.strict_encode64("#{username}:#{password}")}"}
+    }
+  params[:payload] = payload if payload
+  response = RestClient::Request.new(params).execute
+  return JSON.parse(response)
+end
+
+SATELLITE_CONFIG_URI = 'Integration/Satellite/Configuration/default'
+INFOBLOX_CONFIG_URI = 'Integration/Infoblox/IPAM/default'
+
 # Gets an ApiPie binding to the Satellite API.
 #
 # @return ApipieBindings to the Satellite API
-SATELLITE_CONFIG_URI = 'Integration/Satellite/Configuration/default'
 def get_satellite_api()
   satellite_config = $evm.instantiate(SATELLITE_CONFIG_URI)
   error("Satellite Configuration not found") if satellite_config.nil?
@@ -52,6 +68,7 @@ end
 
 begin
   satellite_api = get_satellite_api()
+  infoblox_config = $evm.instantiate(INFOBLOX_CONFIG_URI)
   
   # Get provisioning object
   prov = $evm.root['miq_provision']
@@ -68,7 +85,31 @@ begin
   
   name                      = vm.name
   mac                       = vm.mac_addresses[0]
-  ip                        = nil # TODO: eventully this should come from someplace like Infoblox, for now Satellite assigns it from its DB
+
+  ip = nil #Let Satellite assign an IP unless Infoblox has been configured
+  unless infoblox_config.nil?
+    infoblox_server   = infoblox_config['server']
+    infoblox_username = infoblox_config['username']
+    infoblox_password = infoblox_config.decrypt('password')
+    infoblox_api_version = infoblox_config['api_version']
+
+    url_base = "#{infoblox_server}/wapi/#{infoblox_api_version}/"
+
+    #TODO How do we identify the right subnet?
+    payload = {
+      "name"=>name,
+      "ipv4addrs"=>[{"ipv4addr"=>"func:nextavailableip:172.31.0.0/24"}],
+      "configure_for_dns"=>false
+    }
+
+    creation_result = rest_request(:post, "#{url_base}record:host", payload.to_json)
+    new_record = rest_request(:get, "#{url_base}#{creation_result}")
+    ip = new_record["ipv4addrs"].first["ipv4addr"] || nil
+
+    error("Failed to get IP from Infoblox") if ip.nil?
+  end
+
+
   satellite_organization_id = prov.get_option(:satellite_organization_id) || prov.get_option(:ws_values)[:satellite_organization_id]
   satellite_location_id     = prov.get_option(:satellite_location_id)     || prov.get_option(:ws_values)[:satellite_location_id]
   satellite_hostgroup_id    = prov.get_option(:satellite_hostgroup_id)    || prov.get_option(:ws_values)[:satellite_hostgroup_id]
